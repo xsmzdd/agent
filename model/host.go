@@ -4,6 +4,11 @@ import (
 	pb "github.com/nezhahq/agent/proto"
 )
 
+type SensorTemperature struct {
+	Name        string
+	Temperature float64
+}
+
 type HostState struct {
 	CPU            float64
 	MemUsed        uint64
@@ -20,9 +25,19 @@ type HostState struct {
 	TcpConnCount   uint64
 	UdpConnCount   uint64
 	ProcessCount   uint64
+	Temperatures   []SensorTemperature
+	GPU            float64
 }
 
 func (s *HostState) PB() *pb.State {
+	var ts []*pb.State_SensorTemperature
+	for _, t := range s.Temperatures {
+		ts = append(ts, &pb.State_SensorTemperature{
+			Name:        t.Name,
+			Temperature: t.Temperature,
+		})
+	}
+
 	return &pb.State{
 		Cpu:            s.CPU,
 		MemUsed:        s.MemUsed,
@@ -39,6 +54,8 @@ func (s *HostState) PB() *pb.State {
 		TcpConnCount:   s.TcpConnCount,
 		UdpConnCount:   s.UdpConnCount,
 		ProcessCount:   s.ProcessCount,
+		Temperatures:   ts,
+		Gpu:            s.GPU,
 	}
 }
 
@@ -55,6 +72,7 @@ type Host struct {
 	IP              string `json:"-"`
 	CountryCode     string
 	Version         string
+	GPU             []string
 }
 
 func (h *Host) PB() *pb.Host {
@@ -71,5 +89,6 @@ func (h *Host) PB() *pb.Host {
 		Ip:              h.IP,
 		CountryCode:     h.CountryCode,
 		Version:         h.Version,
+		Gpu:             h.GPU,
 	}
 }

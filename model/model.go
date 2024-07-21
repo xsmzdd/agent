@@ -11,6 +11,9 @@ type AgentConfig struct {
 	HardDrivePartitionAllowlist []string
 	NICAllowlist                map[string]bool
 	DNS                         []string
+	GPU                         bool
+	Temperature                 bool
+	Debug                       bool
 	v                           *viper.Viper
 }
 

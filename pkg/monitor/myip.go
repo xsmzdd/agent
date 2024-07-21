@@ -47,31 +47,51 @@ var (
 		// "https://ip.seeip.org/geoip", // 不精确
 		// "https://freegeoip.app/json/", // 需要 Key
 	}
-	CachedIP, cachedCountry string
+	CachedIP, CachedCountry string
+	Sync                    = make(chan bool)
 	httpClientV4            = util.NewSingleStackHTTPClient(time.Second*20, time.Second*5, time.Second*10, false)
 	httpClientV6            = util.NewSingleStackHTTPClient(time.Second*20, time.Second*5, time.Second*10, true)
 )
 
-// UpdateIP 每30分钟更新一次IP地址与国家码的缓存
-func UpdateIP() {
+// UpdateIP 按设置时间间隔更新IP地址与国家码的缓存
+func UpdateIP(useIPv6CountryCode bool, period uint32) {
 	for {
-		ipv4 := fetchGeoIP(geoIPApiList, false)
-		ipv6 := fetchGeoIP(geoIPApiList, true)
-		if ipv4.IP == "" && ipv6.IP == "" {
-			time.Sleep(time.Minute)
+		util.Println(agentConfig.Debug, "正在更新本地缓存IP信息")
+		var primaryIP, secondaryIP geoIP
+		if useIPv6CountryCode {
+			primaryIP = fetchGeoIP(geoIPApiList, true)
+			secondaryIP = fetchGeoIP(geoIPApiList, false)
+		} else {
+			primaryIP = fetchGeoIP(geoIPApiList, false)
+			secondaryIP = fetchGeoIP(geoIPApiList, true)
+		}
+
+		if primaryIP.IP == "" && secondaryIP.IP == "" {
+			if period > 60 {
+				time.Sleep(time.Minute)
+			} else {
+				time.Sleep(time.Second * time.Duration(period))
+			}
 			continue
 		}
-		if ipv4.IP == "" || ipv6.IP == "" {
-			CachedIP = fmt.Sprintf("%s%s", ipv4.IP, ipv6.IP)
+		if primaryIP.IP == "" || secondaryIP.IP == "" {
+			CachedIP = fmt.Sprintf("%s%s", primaryIP.IP, secondaryIP.IP)
 		} else {
-			CachedIP = fmt.Sprintf("%s/%s", ipv4.IP, ipv6.IP)
+			CachedIP = fmt.Sprintf("%s/%s", primaryIP.IP, secondaryIP.IP)
 		}
-		if ipv4.CountryCode != "" {
-			cachedCountry = ipv4.CountryCode
-		} else if ipv6.CountryCode != "" {
-			cachedCountry = ipv6.CountryCode
+
+		if primaryIP.CountryCode != "" {
+			CachedCountry = primaryIP.CountryCode
+		} else if secondaryIP.CountryCode != "" {
+			CachedCountry = secondaryIP.CountryCode
 		}
-		time.Sleep(time.Minute * 30)
+
+		select {
+		case Sync <- true:
+		default:
+		}
+
+		time.Sleep(time.Second * time.Duration(period))
 	}
 }
 
@@ -93,21 +113,23 @@ func fetchGeoIP(servers []string, isV6 bool) geoIP {
 				continue
 			}
 			resp.Body.Close()
-			if err := ip.Unmarshal(body); err != nil {
+			newIP := geoIP{}
+			if err := newIP.Unmarshal(body); err != nil {
 				continue
 			}
 			// 没取到 v6 IP
-			if isV6 && !strings.Contains(ip.IP, ":") {
+			if isV6 && !strings.Contains(newIP.IP, ":") {
 				continue
 			}
 			// 没取到 v4 IP
-			if !isV6 && !strings.Contains(ip.IP, ".") {
+			if !isV6 && !strings.Contains(newIP.IP, ".") {
 				continue
 			}
 			// 未获取到国家码
-			if ip.CountryCode == "" {
+			if newIP.CountryCode == "" {
 				continue
 			}
+			ip = newIP
 			return ip
 		}
 	}

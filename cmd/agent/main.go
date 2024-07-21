@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"net/url"
@@ -16,17 +17,15 @@ import (
 	"strings"
 	"time"
 
-	"github.com/AlecAivazis/survey/v2"
 	bpc "github.com/DaRealFreak/cloudflare-bp-go"
 	"github.com/blang/semver"
 	"github.com/ebi-yade/altsvc-go"
 	"github.com/go-ping/ping"
-	"github.com/gorilla/websocket"
 	"github.com/nezhahq/go-github-selfupdate/selfupdate"
-	"github.com/shirou/gopsutil/v3/disk"
-	"github.com/shirou/gopsutil/v3/host"
-	psnet "github.com/shirou/gopsutil/v3/net"
-	flag "github.com/spf13/pflag"
+	"github.com/nezhahq/service"
+	"github.com/quic-go/quic-go/http3"
+	"github.com/shirou/gopsutil/v4/host"
+	"github.com/spf13/cobra"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
@@ -45,12 +44,15 @@ type AgentCliParam struct {
 	DisableAutoUpdate     bool   // 关闭自动更新
 	DisableForceUpdate    bool   // 关闭强制更新
 	DisableCommandExecute bool   // 关闭命令执行
-	Debug                 bool   // debug模式
 	Server                string // 服务器地址
 	ClientSecret          string // 客户端密钥
 	ReportDelay           int    // 报告间隔
 	TLS                   bool   // 是否使用TLS加密传输至服务端
+	InsecureTLS           bool   // 是否禁用证书检查
 	Version               bool   // 当前版本号
+	IPReportPeriod        uint32 // 上报IP间隔
+	UseIPv6CountryCode    bool   // 默认优先展示IPv6旗帜
+	UseGiteeToUpgrade     bool   // 强制从Gitee获取更新
 }
 
 var (
@@ -60,6 +62,19 @@ var (
 	inited  bool
 )
 
+var agentCmd = &cobra.Command{
+	Use: "agent",
+	Run: func(cmd *cobra.Command, args []string) {
+		if runtime.GOOS == "darwin" {
+			run() // https://github.com/golang/go/issues/59229
+		} else {
+			runService("", nil)
+		}
+	},
+	PreRun:           preRun,
+	PersistentPreRun: persistPreRun,
+}
+
 var (
 	agentCliParam AgentCliParam
 	agentConfig   model.AgentConfig
@@ -68,6 +83,13 @@ var (
 			return http.ErrUseLastResponse
 		},
 		Timeout: time.Second * 30,
+	}
+	httpClient3 = &http.Client{
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+		Timeout:   time.Second * 30,
+		Transport: &http3.RoundTripper{},
 	}
 )
 
@@ -83,10 +105,7 @@ func init() {
 		d := net.Dialer{
 			Timeout: time.Second * 5,
 		}
-		dnsServers := []string{
-			"1.0.0.1:53", "8.8.4.4:53", "223.5.5.5:53", "223.6.6.6:53",
-			"[2606:4700:4700::1001]:53", "[2001:4860:4860::8844]:53", "[2400:3200::1]:53", "[2400:3200:baba::1]:53",
-		}
+		dnsServers := util.DNSServersAll
 		if len(agentConfig.DNS) > 0 {
 			dnsServers = agentConfig.DNS
 		}
@@ -102,9 +121,8 @@ func init() {
 		}
 		return nil, err
 	}
-	flag.CommandLine.ParseErrorsWhitelist.UnknownFlags = true
 
-	http.DefaultClient.Timeout = time.Second * 5
+	http.DefaultClient.Timeout = time.Second * 30
 	httpClient.Transport = bpc.AddCloudFlareByPass(httpClient.Transport, bpc.Options{
 		AddMissingHeaders: true,
 		Headers: map[string]string{
@@ -118,10 +136,39 @@ func init() {
 	if err != nil {
 		panic(err)
 	}
+
+	// 初始化运行参数
+	agentCmd.PersistentFlags().StringVarP(&agentCliParam.Server, "server", "s", "localhost:5555", "管理面板RPC端口")
+	agentCmd.PersistentFlags().StringVarP(&agentCliParam.ClientSecret, "password", "p", "", "Agent连接Secret")
+	agentCmd.PersistentFlags().BoolVar(&agentCliParam.TLS, "tls", false, "启用SSL/TLS加密")
+	agentCmd.PersistentFlags().BoolVarP(&agentCliParam.InsecureTLS, "insecure", "k", false, "禁用证书检查")
+	agentCmd.PersistentFlags().BoolVarP(&agentConfig.Debug, "debug", "d", false, "开启调试信息")
+	agentCmd.PersistentFlags().IntVar(&agentCliParam.ReportDelay, "report-delay", 1, "系统状态上报间隔")
+	agentCmd.PersistentFlags().BoolVar(&agentCliParam.SkipConnectionCount, "skip-conn", false, "不监控连接数")
+	agentCmd.PersistentFlags().BoolVar(&agentCliParam.SkipProcsCount, "skip-procs", false, "不监控进程数")
+	agentCmd.PersistentFlags().BoolVar(&agentCliParam.DisableCommandExecute, "disable-command-execute", false, "禁止在此机器上执行命令")
+	agentCmd.PersistentFlags().BoolVar(&agentCliParam.DisableAutoUpdate, "disable-auto-update", false, "禁用自动升级")
+	agentCmd.PersistentFlags().BoolVar(&agentCliParam.DisableForceUpdate, "disable-force-update", false, "禁用强制升级")
+	agentCmd.PersistentFlags().BoolVar(&agentCliParam.UseIPv6CountryCode, "use-ipv6-countrycode", false, "使用IPv6的位置上报")
+	agentCmd.PersistentFlags().BoolVar(&agentConfig.GPU, "gpu", false, "启用GPU监控")
+	agentCmd.PersistentFlags().BoolVar(&agentConfig.Temperature, "temperature", false, "启用温度监控")
+	agentCmd.PersistentFlags().BoolVar(&agentCliParam.UseGiteeToUpgrade, "gitee", false, "使用Gitee获取更新")
+	agentCmd.PersistentFlags().Uint32VarP(&agentCliParam.IPReportPeriod, "ip-report-period", "u", 30*60, "本地IP更新间隔, 上报频率依旧取决于report-delay的值")
+	agentCmd.Flags().BoolVarP(&agentCliParam.Version, "version", "v", false, "查看当前版本号")
+
 	agentConfig.Read(filepath.Dir(ex) + "/config.yml")
+
+	monitor.InitConfig(&agentConfig)
 }
 
 func main() {
+	if err := agentCmd.Execute(); err != nil {
+		fmt.Println(err)
+		os.Exit(1)
+	}
+}
+
+func persistPreRun(cmd *cobra.Command, args []string) {
 	// windows环境处理
 	if runtime.GOOS == "windows" {
 		hostArch, err := host.KernelArch()
@@ -141,47 +188,26 @@ func main() {
 			panic(fmt.Sprintf("与当前系统不匹配，当前运行 %s_%s, 需要下载 %s_%s", runtime.GOOS, arch, runtime.GOOS, hostArch))
 		}
 	}
+}
 
+func preRun(cmd *cobra.Command, args []string) {
 	// 来自于 GoReleaser 的版本号
 	monitor.Version = version
 
-	// 初始化运行参数
-	var isEditAgentConfig bool
-	flag.BoolVarP(&agentCliParam.Debug, "debug", "d", false, "开启调试信息")
-	flag.BoolVarP(&isEditAgentConfig, "edit-agent-config", "c", false, "修改要监控的网卡/分区名单，修改自定义 DNS")
-	flag.StringVarP(&agentCliParam.Server, "server", "s", "localhost:5555", "管理面板RPC端口")
-	flag.StringVarP(&agentCliParam.ClientSecret, "password", "p", "", "Agent连接Secret")
-	flag.IntVar(&agentCliParam.ReportDelay, "report-delay", 1, "系统状态上报间隔")
-	flag.BoolVar(&agentCliParam.SkipConnectionCount, "skip-conn", false, "不监控连接数")
-	flag.BoolVar(&agentCliParam.SkipProcsCount, "skip-procs", false, "不监控进程数")
-	flag.BoolVar(&agentCliParam.DisableCommandExecute, "disable-command-execute", false, "禁止在此机器上执行命令")
-	flag.BoolVar(&agentCliParam.DisableAutoUpdate, "disable-auto-update", false, "禁用自动升级")
-	flag.BoolVar(&agentCliParam.DisableForceUpdate, "disable-force-update", false, "禁用强制升级")
-	flag.BoolVar(&agentCliParam.TLS, "tls", false, "启用SSL/TLS加密")
-	flag.BoolVarP(&agentCliParam.Version, "version", "v", false, "查看当前版本号")
-	flag.Parse()
-
 	if agentCliParam.Version {
 		fmt.Println(version)
-		return
-	}
-
-	if isEditAgentConfig {
-		editAgentConfig()
-		return
+		os.Exit(0)
 	}
 
 	if agentCliParam.ClientSecret == "" {
-		flag.Usage()
-		return
+		cmd.Help()
+		os.Exit(1)
 	}
 
 	if agentCliParam.ReportDelay < 1 || agentCliParam.ReportDelay > 4 {
 		println("report-delay 的区间为 1-4")
-		return
+		os.Exit(1)
 	}
-
-	run()
 }
 
 func run() {
@@ -196,7 +222,7 @@ func run() {
 	// 上报服务器信息
 	go reportState()
 	// 更新IP信息
-	go monitor.UpdateIP()
+	go monitor.UpdateIP(agentCliParam.UseIPv6CountryCode, agentCliParam.IPReportPeriod)
 
 	// 定时检查更新
 	if _, err := semver.Parse(version); err == nil && !agentCliParam.DisableAutoUpdate {
@@ -225,7 +251,11 @@ func run() {
 		timeOutCtx, cancel := context.WithTimeout(context.Background(), networkTimeOut)
 		var securityOption grpc.DialOption
 		if agentCliParam.TLS {
-			securityOption = grpc.WithTransportCredentials(credentials.NewTLS(&tls.Config{MinVersion: tls.VersionTLS12}))
+			if agentCliParam.InsecureTLS {
+				securityOption = grpc.WithTransportCredentials(credentials.NewTLS(&tls.Config{MinVersion: tls.VersionTLS12, InsecureSkipVerify: true}))
+			} else {
+				securityOption = grpc.WithTransportCredentials(credentials.NewTLS(&tls.Config{MinVersion: tls.VersionTLS12}))
+			}
 		} else {
 			securityOption = grpc.WithTransportCredentials(insecure.NewCredentials())
 		}
@@ -240,7 +270,7 @@ func run() {
 		client = pb.NewNezhaServiceClient(conn)
 		// 第一步注册
 		timeOutCtx, cancel = context.WithTimeout(context.Background(), networkTimeOut)
-		_, err = client.ReportSystemInfo(timeOutCtx, monitor.GetHost(&agentConfig).PB())
+		_, err = client.ReportSystemInfo(timeOutCtx, monitor.GetHost().PB())
 		if err != nil {
 			println("上报系统信息失败：", err)
 			cancel()
@@ -250,7 +280,7 @@ func run() {
 		cancel()
 		inited = true
 		// 执行 Task
-		tasks, err := client.RequestTask(context.Background(), monitor.GetHost(&agentConfig).PB())
+		tasks, err := client.RequestTask(context.Background(), monitor.GetHost().PB())
 		if err != nil {
 			println("请求任务失败：", err)
 			retry()
@@ -259,6 +289,69 @@ func run() {
 		err = receiveTasks(tasks)
 		println("receiveTasks exit to main：", err)
 		retry()
+	}
+}
+
+func runService(action string, flags []string) {
+	dir, err := os.Getwd()
+	if err != nil {
+		println("获取当前工作目录时出错: ", err)
+		return
+	}
+
+	winConfig := map[string]interface{}{
+		"OnFailure": "restart",
+	}
+
+	svcConfig := &service.Config{
+		Name:             "nezha-agent",
+		DisplayName:      "Nezha Agent",
+		Description:      "哪吒探针监控端",
+		Arguments:        flags,
+		WorkingDirectory: dir,
+		Option:           winConfig,
+	}
+
+	prg := &program{
+		exit: make(chan struct{}),
+	}
+	s, err := service.New(prg, svcConfig)
+	if err != nil {
+		log.Fatal("创建服务时出错: ", err)
+	}
+	prg.service = s
+
+	errs := make(chan error, 5)
+	util.Logger, err = s.Logger(errs)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	go func() {
+		for {
+			err := <-errs
+			if err != nil {
+				log.Print(err)
+			}
+		}
+	}()
+
+	if action == "install" {
+		initName := s.Platform()
+		log.Println("Init system is:", initName)
+	}
+
+	if len(action) != 0 {
+		err := service.Control(s, action)
+		if err != nil {
+			log.Fatal(err)
+		}
+		return
+	}
+
+	err = s.Run()
+	if err != nil {
+		util.Logger.Error(err)
 	}
 }
 
@@ -287,8 +380,6 @@ func doTask(task *pb.Task) {
 	result.Id = task.GetId()
 	result.Type = task.GetType()
 	switch task.GetType() {
-	case model.TaskTypeTerminal:
-		handleTerminalTask(task)
 	case model.TaskTypeHTTPGET:
 		handleHttpGetTask(task, &result)
 	case model.TaskTypeICMPPing:
@@ -299,10 +390,16 @@ func doTask(task *pb.Task) {
 		handleCommandTask(task, &result)
 	case model.TaskTypeUpgrade:
 		handleUpgradeTask(task, &result)
-	case model.TaskTypeKeepalive:
+	case model.TaskTypeTerminalGRPC:
+		handleTerminalTask(task)
 		return
+	case model.TaskTypeNAT:
+		handleNATTask(task)
+		return
+	case model.TaskTypeKeepalive:
 	default:
 		println("不支持的任务：", task)
+		return
 	}
 	client.ReportTask(context.Background(), &result)
 }
@@ -315,9 +412,9 @@ func reportState() {
 	for {
 		// 为了更准确的记录时段流量，inited 后再上传状态信息
 		if client != nil && inited {
-			monitor.TrackNetworkSpeed(&agentConfig)
+			monitor.TrackNetworkSpeed()
 			timeOutCtx, cancel := context.WithTimeout(context.Background(), networkTimeOut)
-			_, err = client.ReportSystemState(timeOutCtx, monitor.GetState(&agentConfig, agentCliParam.SkipConnectionCount, agentCliParam.SkipProcsCount).PB())
+			_, err = client.ReportSystemState(timeOutCtx, monitor.GetState(agentCliParam.SkipConnectionCount, agentCliParam.SkipProcsCount).PB())
 			cancel()
 			if err != nil {
 				println("reportState error", err)
@@ -326,7 +423,7 @@ func reportState() {
 			// 每10分钟重新获取一次硬件信息
 			if lastReportHostInfo.Before(time.Now().Add(-10 * time.Minute)) {
 				lastReportHostInfo = time.Now()
-				client.ReportSystemInfo(context.Background(), monitor.GetHost(&agentConfig).PB())
+				client.ReportSystemInfo(context.Background(), monitor.GetHost().PB())
 			}
 		}
 		time.Sleep(time.Second * time.Duration(agentCliParam.ReportDelay))
@@ -335,12 +432,19 @@ func reportState() {
 
 // doSelfUpdate 执行更新检查 如果更新成功则会结束进程
 func doSelfUpdate(useLocalVersion bool) {
+	<-monitor.Sync
 	v := semver.MustParse("0.1.0")
 	if useLocalVersion {
 		v = semver.MustParse(version)
 	}
 	println("检查更新：", v)
-	latest, err := selfupdate.UpdateSelf(v, "nezhahq/agent")
+	var latest *selfupdate.Release
+	var err error
+	if monitor.CachedCountry != "CN" && !agentCliParam.UseGiteeToUpgrade {
+		latest, err = selfupdate.UpdateSelf(v, "nezhahq/agent")
+	} else {
+		latest, err = selfupdate.UpdateSelfGitee(v, "naibahq/agent")
+	}
 	if err != nil {
 		println("更新失败：", err)
 		return
@@ -351,7 +455,7 @@ func doSelfUpdate(useLocalVersion bool) {
 	}
 }
 
-func handleUpgradeTask(task *pb.Task, result *pb.TaskResult) {
+func handleUpgradeTask(*pb.Task, *pb.TaskResult) {
 	if agentCliParam.DisableForceUpdate {
 		return
 	}
@@ -401,6 +505,10 @@ func handleHttpGetTask(task *pb.Task, result *pb.TaskResult) {
 
 func checkHttpResp(taskUrl string, start time.Time, resp *http.Response, err error, result *pb.TaskResult) {
 	if err == nil {
+		defer resp.Body.Close()
+		_, err = io.Copy(io.Discard, resp.Body)
+	}
+	if err == nil {
 		// 检查 HTTP Response 状态
 		result.Delay = float32(time.Since(start).Microseconds()) / 1000.0
 		if resp.StatusCode > 399 || resp.StatusCode < 200 {
@@ -447,11 +555,14 @@ func checkAltSvc(start time.Time, altSvcStr string, taskUrl string, result *pb.T
 
 	altAuthorityHost := ""
 	altAuthorityPort := ""
+	altAuthorityProtocol := ""
 	for _, altSvc := range altSvcList {
+		altAuthorityPort = altSvc.AltAuthority.Port
 		if altSvc.AltAuthority.Host != "" {
 			altAuthorityHost = altSvc.AltAuthority.Host
+			altAuthorityProtocol = altSvc.ProtocolID
+			break
 		}
-		altAuthorityPort = altSvc.AltAuthority.Port
 	}
 	if altAuthorityHost == "" {
 		altAuthorityHost = originalHost
@@ -464,10 +575,12 @@ func checkAltSvc(start time.Time, altSvcStr string, taskUrl string, result *pb.T
 	altAuthorityUrl := "https://" + altAuthorityHost + ":" + altAuthorityPort + "/"
 	req, _ := http.NewRequest("GET", altAuthorityUrl, nil)
 	req.Host = originalHost
-	req.Header.Add("Upgrade", originalHost)
-	req.Header.Add("Connection", "Upgrade")
 
-	resp, err := httpClient.Do(req)
+	client := httpClient
+	if strings.HasPrefix(altAuthorityProtocol, "h3") {
+		client = httpClient3
+	}
+	resp, err := client.Do(req)
 
 	checkHttpResp(altAuthorityUrl, start, resp, err, result)
 }
@@ -532,24 +645,20 @@ func handleTerminalTask(task *pb.Task) {
 		println("Terminal 任务解析错误：", err)
 		return
 	}
-	protocol := "ws"
-	if terminal.UseSSL {
-		protocol += "s"
-	}
-	header := http.Header{}
-	header.Add("Secret", agentCliParam.ClientSecret)
-	// 目前只兼容Cloudflare验证
-	// 后续可能需要兼容更多的Cookie验证情况
-	if terminal.Cookie != "" {
-		cfCookie := fmt.Sprintf("CF_Authorization=%s", terminal.Cookie)
-		header.Add("Cookie", cfCookie)
-	}
-	conn, _, err := websocket.DefaultDialer.Dial(fmt.Sprintf("%s://%s/terminal/%s", protocol, terminal.Host, terminal.Session), header)
+
+	remoteIO, err := client.IOStream(context.Background())
 	if err != nil {
-		println("Terminal 连接失败：", err)
+		println("Terminal IOStream失败：", err)
 		return
 	}
-	defer conn.Close()
+
+	// 发送 StreamID
+	if err := remoteIO.Send(&pb.IOStreamData{Data: append([]byte{
+		0xff, 0x05, 0xff, 0x05,
+	}, []byte(terminal.StreamID)...)}); err != nil {
+		println("Terminal 发送StreamID失败：", err)
+		return
+	}
 
 	tty, err := pty.Start()
 	if err != nil {
@@ -559,50 +668,37 @@ func handleTerminalTask(task *pb.Task) {
 
 	defer func() {
 		err := tty.Close()
-		conn.Close()
-		println("terminal exit", terminal.Session, err)
+		errCloseSend := remoteIO.CloseSend()
+		println("terminal exit", terminal.StreamID, err, errCloseSend)
 	}()
-	println("terminal init", terminal.Session)
+	println("terminal init", terminal.StreamID)
 
 	go func() {
 		for {
-			buf := make([]byte, 1024)
+			buf := make([]byte, 10240)
 			read, err := tty.Read(buf)
 			if err != nil {
-				conn.WriteMessage(websocket.TextMessage, []byte(err.Error()))
-				conn.Close()
+				remoteIO.Send(&pb.IOStreamData{Data: []byte(err.Error())})
+				remoteIO.CloseSend()
 				return
 			}
-			conn.WriteMessage(websocket.BinaryMessage, buf[:read])
+			remoteIO.Send(&pb.IOStreamData{Data: buf[:read]})
 		}
 	}()
 
 	for {
-		messageType, reader, err := conn.NextReader()
-		if err != nil {
+		var remoteData *pb.IOStreamData
+		if remoteData, err = remoteIO.Recv(); err != nil {
 			return
 		}
-
-		if messageType == websocket.TextMessage {
-			continue
-		}
-
-		dataTypeBuf := make([]byte, 1)
-		read, err := reader.Read(dataTypeBuf)
-		if err != nil {
-			conn.WriteMessage(websocket.TextMessage, []byte("Unable to read message type from reader"))
+		if remoteData.Data == nil || len(remoteData.Data) == 0 {
 			return
 		}
-
-		if read != 1 {
-			return
-		}
-
-		switch dataTypeBuf[0] {
+		switch remoteData.Data[0] {
 		case 0:
-			io.Copy(tty, reader)
+			tty.Write(remoteData.Data[1:])
 		case 1:
-			decoder := util.Json.NewDecoder(reader)
+			decoder := util.Json.NewDecoder(strings.NewReader(string(remoteData.Data[1:])))
 			var resizeMessage WindowSize
 			err := decoder.Decode(&resizeMessage)
 			if err != nil {
@@ -613,103 +709,65 @@ func handleTerminalTask(task *pb.Task) {
 	}
 }
 
-// 修改Agent要监控的网卡与硬盘分区
-func editAgentConfig() {
-	nc, err := psnet.IOCounters(true)
+func handleNATTask(task *pb.Task) {
+	var nat model.TaskNAT
+	err := util.Json.Unmarshal([]byte(task.GetData()), &nat)
 	if err != nil {
-		panic(err)
-	}
-	var nicAllowlistOptions []string
-	for _, v := range nc {
-		nicAllowlistOptions = append(nicAllowlistOptions, v.Name)
-	}
-
-	var diskAllowlistOptions []string
-	diskList, err := disk.Partitions(false)
-	if err != nil {
-		panic(err)
-	}
-	for _, p := range diskList {
-		diskAllowlistOptions = append(diskAllowlistOptions, fmt.Sprintf("%s\t%s\t%s", p.Mountpoint, p.Fstype, p.Device))
-	}
-
-	var qs = []*survey.Question{
-		{
-			Name: "nic",
-			Prompt: &survey.MultiSelect{
-				Message: "选择要监控的网卡",
-				Options: nicAllowlistOptions,
-			},
-		},
-		{
-			Name: "disk",
-			Prompt: &survey.MultiSelect{
-				Message: "选择要监控的硬盘分区",
-				Options: diskAllowlistOptions,
-			},
-		},
-		{
-			Name: "dns",
-			Prompt: &survey.Input{
-				Message: "自定义 DNS，可输入空格跳过，如 1.1.1.1:53,1.0.0.1:53",
-				Default: strings.Join(agentConfig.DNS, ","),
-			},
-		},
-	}
-
-	answers := struct {
-		Nic  []string
-		Disk []string
-		DNS  string
-	}{}
-
-	err = survey.Ask(qs, &answers, survey.WithValidator(survey.Required))
-	if err != nil {
-		fmt.Println("选择错误", err.Error())
+		println("NAT 任务解析错误：", err)
 		return
 	}
 
-	agentConfig.HardDrivePartitionAllowlist = []string{}
-	for _, v := range answers.Disk {
-		agentConfig.HardDrivePartitionAllowlist = append(agentConfig.HardDrivePartitionAllowlist, strings.Split(v, "\t")[0])
+	remoteIO, err := client.IOStream(context.Background())
+	if err != nil {
+		println("NAT IOStream失败：", err)
+		return
 	}
 
-	agentConfig.NICAllowlist = make(map[string]bool)
-	for _, v := range answers.Nic {
-		agentConfig.NICAllowlist[v] = true
+	// 发送 StreamID
+	if err := remoteIO.Send(&pb.IOStreamData{Data: append([]byte{
+		0xff, 0x05, 0xff, 0x05,
+	}, []byte(nat.StreamID)...)}); err != nil {
+		println("NAT 发送StreamID失败：", err)
+		return
 	}
 
-	dnsServers := strings.TrimSpace(answers.DNS)
+	conn, err := net.Dial("tcp", nat.Host)
+	if err != nil {
+		println(fmt.Sprintf("NAT Dial %s 失败：%s", nat.Host, err))
+		return
+	}
 
-	if dnsServers != "" {
-		agentConfig.DNS = strings.Split(dnsServers, ",")
-		for _, s := range agentConfig.DNS {
-			host, _, err := net.SplitHostPort(s)
-			if err == nil {
-				if net.ParseIP(host) == nil {
-					err = errors.New("格式错误")
-				}
-			}
+	defer func() {
+		err := conn.Close()
+		errCloseSend := remoteIO.CloseSend()
+		println("NAT exit", nat.StreamID, err, errCloseSend)
+	}()
+	println("NAT init", nat.StreamID)
+
+	go func() {
+		buf := make([]byte, 10240)
+		for {
+			read, err := conn.Read(buf)
 			if err != nil {
-				panic(fmt.Sprintf("自定义 DNS 格式错误：%s %v", s, err))
+				remoteIO.Send(&pb.IOStreamData{Data: []byte(err.Error())})
+				remoteIO.CloseSend()
+				return
 			}
+			remoteIO.Send(&pb.IOStreamData{Data: buf[:read]})
 		}
-	} else {
-		agentConfig.DNS = []string{}
-	}
+	}()
 
-	if err = agentConfig.Save(); err != nil {
-		panic(err)
+	for {
+		var remoteData *pb.IOStreamData
+		if remoteData, err = remoteIO.Recv(); err != nil {
+			return
+		}
+		conn.Write(remoteData.Data)
 	}
-
-	fmt.Println("修改自定义配置成功，重启 Agent 后生效")
 }
 
 func println(v ...interface{}) {
-	if agentCliParam.Debug {
-		fmt.Printf("NEZHA@%s>> ", time.Now().Format("2006-01-02 15:04:05"))
-		fmt.Println(v...)
-	}
+	util.Println(agentConfig.Debug, v...)
 }
 
 func generateQueue(start int, size int) []int {
