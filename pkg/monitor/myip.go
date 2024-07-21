@@ -43,7 +43,7 @@ var (
 		"https://api.ip.sb/geoip",
 		"https://ipapi.co/json",
 		"http://ip-api.com/json/",
-		// "https://extreme-ip-lookup.com/json/", // 不精确
+		"https://extreme-ip-lookup.com/json/", // 不精确
 		// "https://ip.seeip.org/geoip", // 不精确
 		// "https://freegeoip.app/json/", // 需要 Key
 	}
